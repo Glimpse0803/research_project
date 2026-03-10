@@ -508,11 +508,39 @@ def main():
         optimizer_mod.step()
 
         if step % 500 == 0:
-            est_psnr = -10 * np.log10(loss.item())
-            print(f"  Step {step}/{TOTAL_STEPS} | Est. PSNR: {est_psnr:.2f} dB")
-            if est_psnr > best_avg_psnr:
-                best_avg_psnr = est_psnr
+            est_psnr = 10 * np.log10(1.0 / max(loss.item(), 1e-10))
+
+            # ==========================================
+            # 新增：计算所有视图的真实平均 PSNR
+            # ==========================================
+            final_net.eval()  # 1. 切换到评估模式 (锁定 BN 统计量)
+            current_total_psnr = 0.0
+
+            with torch.no_grad():  # 2. 禁用梯度计算，节省显存并加速
+                for (u, v) in view_keys:
+                    u_t = torch.tensor([u], dtype=torch.long, device=device)
+                    v_t = torch.tensor([v], dtype=torch.long, device=device)
+
+                    # 前向传播 (单图推理)
+                    out_val = final_net(net_input_saved, u_t, v_t)
+
+                    # 使用导入的 psnr 函数计算
+                    p = psnr(out_val.cpu().numpy()[0], lf_data[(u, v)].cpu().numpy()[0])
+                    current_total_psnr += p
+
+            actual_avg_psnr = current_total_psnr / TOTAL_VIEWS
+            final_net.train()  # 3. 恢复训练模式
+            # ==========================================
+
+            # 打印估算 PSNR 和 真实 PSNR
+            print(
+                f"  Step {step}/{TOTAL_STEPS} | Batch Est. PSNR: {est_psnr:.2f} dB | True Avg PSNR: {actual_avg_psnr:.2f} dB")
+
+            # 使用真实的平均 PSNR 来更新最佳状态
+            if actual_avg_psnr > best_avg_psnr:
+                best_avg_psnr = actual_avg_psnr
                 best_state = copy.deepcopy(final_net.state_dict())
+                print(f"    --> New Best Model Saved! (True Avg PSNR: {best_avg_psnr:.2f} dB)")
 
     # ==========================================================
     # 评估与保存
@@ -535,4 +563,5 @@ def main():
 
 
 if __name__ == "__main__":
+    seed_everything(42)
     main()
