@@ -301,7 +301,7 @@ def main():
     k_channels = CONFIG['k_channels']  # 64
     BATCH_SIZE = 10  # 真正的并行 Batch Size
 
-    balanced_schedule = [(600, 2400), (800, 2200), (600, 2400), (1000, 2500), (800, 3200)]
+    balanced_schedule = [(800, 2200), (600, 2400), (800, 2200), (1200, 2300), (1000, 3000)]
     upsample_configs = [True, True, True, True, False]
 
     lf_data = load_lf_images(data_path)
@@ -574,3 +574,4 @@ def main():
 if __name__ == "__main__":
     seed_everything(42)
     main()
+
