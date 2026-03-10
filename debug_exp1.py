@@ -301,7 +301,7 @@ def main():
     k_channels = CONFIG['k_channels']  # 64
     BATCH_SIZE = 10  # 真正的并行 Batch Size
 
-    balanced_schedule = [(600, 1400), (800, 1200), (600, 1400), (800, 1200), (800, 1200)]
+    balanced_schedule = [(600, 2400), (800, 2200), (600, 2400), (1000, 2500), (800, 3200)]
     upsample_configs = [True, True, True, True, False]
 
     lf_data = load_lf_images(data_path)
@@ -455,6 +455,15 @@ def main():
 
     # 【极其关键的一步】：全面唤醒 Modulator！
     final_net.set_modulator_status(True)
+
+    # ==========================================
+    # 新增：Modulator 零初始化 (Zero-Init)
+    # ==========================================
+    for blk in final_net.main_body:
+        # 将 Modulator 的 BN 层的 weight(gamma) 初始化为 0
+        nn.init.constant_(blk.mod_bn.weight, 0)
+        nn.init.constant_(blk.mod_bn.bias, 0)
+    # ==========================================
 
     for p in final_net.parameters(): p.requires_grad = True
     final_net.train()
