@@ -127,7 +127,7 @@ class ModulatorBank(nn.Module):
         self.kernels_v = nn.Parameter(torch.randn(v_views, 1, in_channels, kernel_size, kernel_size))
         nn.init.normal_(self.kernels_u, std=0.01)
         nn.init.normal_(self.kernels_v, std=0.01)
-
+    '''
     def forward(self, x, u_idx, v_idx):
         # u_idx, v_idx: [B] 的 tensor
         B = x.shape[0]
@@ -140,7 +140,34 @@ class ModulatorBank(nn.Module):
             out_i = F.conv2d(x_pad[i:i + 1], active_kernel)
             results.append(out_i)
         return torch.cat(results, dim=0)
+    '''
+    # 修正并行逻辑
+        def forward(self, x, u_idx, v_idx):
+        B, C, H, W = x.shape
+        x_pad = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='reflect')
 
+        # 1. 【并行收集】一次性获取整个 Batch 的卷积核
+        # k_u 形状: [B, 1, C_in, k, k]
+        k_u = self.kernels_u[u_idx]
+        k_v = self.kernels_v[v_idx]
+
+        # 2. 【形状变换】将核拼在一起，并转换为 group 卷积所需的形状
+        # active_kernel 拼接后形状: [B, 2, C_in, k, k]
+        # 转换为: [B * 2, C_in, k, k]
+        active_kernel = torch.cat([k_u, k_v], dim=1).view(B * 2, C, self.k, self.k)
+
+        # 3. 【Batch 融合】把输入图片的 Batch 维度融合进 Channel 维度
+        # x_pad 从 [B, C_in, H+pad, W+pad] 变身为 [1, B * C_in, H+pad, W+pad]
+        x_pad = x_pad.view(1, B * C, x_pad.shape[2], x_pad.shape[3])
+
+        # 4. 【真正的 GPU 并行计算】利用 groups 参数，一次性算完所有不同的核！
+        # groups=B 意味着把输入分为 B 组，每组刚好对应一个样本和它的专属核
+        out = F.conv2d(x_pad, active_kernel, groups=B)
+
+        # 5. 【还原形状】算完之后，把输出拆回正常的 Batch 形状 [B, 2, H, W]
+        out = out.view(B, 2, H, W)
+
+        return out
 
 class HybridBlock(nn.Module):
     def __init__(self, in_channels, out_channels=64, upsample=True):
@@ -512,4 +539,5 @@ def main_final_optimized():
 
 if __name__ == "__main__":
     seed_everything(42)
+
     main_final_optimized()
