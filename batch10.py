@@ -161,6 +161,8 @@ class HybridBlock(nn.Module):
         self.desc_act = ImprovedSelfAttentionAct(channels=self.desc_ch)
 
         self.mod_conv = ModulatorBank(in_channels, self.mod_ch, 3)
+        # 新增
+        self.mod_bn = nn.BatchNorm2d(self.mod_ch, affine=True)
         self.mod_act = nn.GELU()
 
         self.upsample = upsample
@@ -175,6 +177,7 @@ class HybridBlock(nn.Module):
 
         if self.enable_modulator:
             out_mod = self.mod_conv(x, u_idx, v_idx)
+            out_mod = self.mod_bn(out_mod)
             if self.upsample: out_mod = self.up_layer(out_mod)
             out_mod = self.mod_act(out_mod)
         else:
@@ -210,8 +213,18 @@ class GrowingDecoder(nn.Module):
         return out
 
     def set_modulator_status(self, status):
-        for blk in self.fixed_blocks: blk.enable_modulator = status
+        for blk in self.fixed_blocks:
+            blk.enable_modulator = status
+            # 如果关闭，强制将 BN 设置为 eval 模式，避免统计量漂移
+            if not status:
+                blk.mod_bn.eval()
+            else:
+                blk.mod_bn.train()
         self.candidate_block.enable_modulator = status
+        if not status:
+            self.candidate_block.mod_bn.eval()
+        else:
+            self.candidate_block.mod_bn.train()
 
 
 class FinalDecoder(nn.Module):
@@ -230,7 +243,13 @@ class FinalDecoder(nn.Module):
         return self.output_head(out)
 
     def set_modulator_status(self, status):
-        for blk in self.main_body: blk.enable_modulator = status
+        for blk in self.main_body:
+            blk.enable_modulator = status
+            # 如果关闭，强制将 BN 设置为 eval 模式，避免统计量漂移
+            if not status:
+                blk.mod_bn.eval()
+            else:
+                blk.mod_bn.train()
 
 
 # ==========================================
@@ -272,7 +291,7 @@ def main_final_optimized():
     os.makedirs(save_dir, exist_ok=True)
 
     k_channels = CONFIG['k_channels']
-    balanced_schedule = [(600, 2400), (800, 2200), (600, 2400), (1000, 2500), (800, 3200)]
+    balanced_schedule = [(800, 2200), (600, 2400), (800, 2200), (1200, 2300), (1000, 3000)]
     upsample_configs = [True, True, True, True, False]
 
     # === [设置 Batch Size] ===
@@ -324,6 +343,16 @@ def main_final_optimized():
     # ---------------- Phase 1: Growing ----------------
     print(f"\n{'=' * 20} Phase 1: Layer-wise Growing (SA + Parallel Batch 10) {'=' * 20}")
 
+    # 获取中心视图坐标
+    center_idx = TOTAL_VIEWS // 2
+    center_u, center_v = view_keys[center_idx]
+    print(f"Phase 1 will search architecture ONLY on Center View: ({center_u}, {center_v})")
+
+    # Phase 1 的数据固定为中心视图
+    b_u_center = torch.tensor([center_u] * BATCH_SIZE, dtype=torch.long, device=device)
+    b_v_center = torch.tensor([center_v] * BATCH_SIZE, dtype=torch.long, device=device)
+    center_target = lf_data[(center_u, center_v)]
+
     for layer_idx, (upsample, (n_search, n_refine)) in enumerate(zip(upsample_configs, balanced_schedule)):
         print(f"\n[Layer {layer_idx + 1}] Search: {n_search} | Refine: {n_refine}")
 
@@ -335,56 +364,45 @@ def main_final_optimized():
         net = GrowingDecoder(fixed_blocks, cand, 3, (target_h, target_w)).type(dtype)
 
         net.set_modulator_status(False)
-        optimizer = torch.optim.Adam(net.parameters(), lr=0.005)
+        optimizer = torch.optim.Adam(net.parameters(), lr=CONFIG['search_lr'])
         net.train()
 
-        # === Phase 1.1 Search ===
+        # --- 1.1 Search 架构 ---
         for i in range(n_search):
-            b_input, b_u, b_v, b_target = get_batch(BATCH_SIZE)
-            if CONFIG['reg_noise_std'] > 0:
-                cur_std = CONFIG['reg_noise_std'] if i % 500 else 0
-                ni = b_input + (torch.randn_like(b_input) * cur_std)
-            else:
-                ni = b_input
-
             optimizer.zero_grad()
-            out = net(ni, b_u, b_v)
-            loss = mse(out, b_target)  # 一次完成并行计算，无需累加
+            # 【优化】：只取第 0 个样本，[1, C, H, W] 和 [1]
+            out = net(net_input_saved[0:1], b_u_center[0:1], b_v_center[0:1])
+            loss = mse(out, center_target)
             loss.backward()
             optimizer.step()
 
-            if i % 100 == 0:
-                print(f"    Search Step {i}/{n_search} - Avg Batch Loss: {loss.item():.6f}")
+            if i % 200 == 0:
+                print(f"    Search Step {i}/{n_search} - Loss: {loss.item():.6f}")
 
-
-        # === Fix Selection (使用中心视角) ===
+        # --- 1.2 Fix Selection (利用中心视角) ---
         with torch.no_grad():
-            # 获取中心视角的坐标 (例如 81 张图的话，取第 40 个即中心图)
-            mid_key = view_keys[TOTAL_VIEWS // 2]
-            b_u_mid = torch.tensor([mid_key[0]], dtype=torch.long, device=device)
-            b_v_mid = torch.tensor([mid_key[1]], dtype=torch.long, device=device)
+            net.eval()
+            # 【优化点】：这里加上 [0:1]
+            x_f = net_input_saved[0:1]
+            for blk in net.fixed_blocks: x_f = blk(x_f, b_u_center[0:1], b_v_center[0:1])
+            # cand.desc_act.fix_selection(cand.desc_conv(x_f))
+            # 使用新增的辅助函数获取经过 BN 和 Up 的特征
+            act_input = cand.get_act_input(x_f, b_u_center[0:1], b_v_center[0:1])
+            cand.desc_act.fix_selection(act_input)
 
-            x_f = net_input_saved  # 使用单张的基础输入 [1, C, 32, 32]
-            for blk in net.fixed_blocks:
-                x_f = blk(x_f, b_u_mid, b_v_mid)
+            c = Counter([cand.desc_act.act_names[idx] for idx in cand.desc_act.fixed_indices.cpu().numpy()])
+            print(f"  > Layer {layer_idx + 1} Selection: {dict(c)}")
+            net.train()
 
-            cand.desc_act.fix_selection(cand.desc_conv(x_f))
-
-            # 打印选择结果
-            indices = cand.desc_act.fixed_indices.cpu().numpy()
-            c = Counter([cand.desc_act.act_names[idx] for idx in indices])
-            print(f"  > Layer {layer_idx + 1} Selection (Center View {mid_key}): {dict(c)}")
-
-        # === Phase 1.2 Refine ===
-        for pg in optimizer.param_groups: pg['lr'] = 0.005 * 0.8
+        # --- 1.3 Refine 权重 ---
+        for pg in optimizer.param_groups: pg['lr'] = CONFIG['search_lr'] * 0.8
         for i in range(n_refine):
-            b_input, b_u, b_v, b_target = get_batch(BATCH_SIZE)
-
             optimizer.zero_grad()
-            out = net(b_input, b_u, b_v)
-            loss = mse(out, b_target)
+            out = net(net_input_saved[0:1], b_u_center[0:1], b_v_center[0:1])
+            loss = mse(out, center_target)
             loss.backward()
             optimizer.step()
+
             if i % 500 == 0:
                 print(f"    Refine Step {i}/{n_refine} - Avg Batch Loss: {loss.item():.6f}")
 
@@ -393,15 +411,11 @@ def main_final_optimized():
 
         # 简单验证 (打印中心视角 PSNR)
         with torch.no_grad():
-            mid_key = view_keys[TOTAL_VIEWS // 2]
-            b_u_mid = torch.tensor([mid_key[0]], dtype=torch.long, device=device)
-            b_v_mid = torch.tensor([mid_key[1]], dtype=torch.long, device=device)
-            b_target_mid = lf_data[mid_key]
-
-            out = net(net_input_saved, b_u_mid, b_v_mid)
-            p = psnr(out.cpu().numpy()[0], b_target_mid.cpu().numpy()[0])
-            print(f"  > Layer {layer_idx + 1} Done. Center View {mid_key} PSNR: {p:.2f} dB")
-
+            # 【优化点】：这里加上 [0:1]
+            out = net(net_input_saved[0:1], b_u_center[0:1], b_v_center[0:1])
+            p = psnr(out.cpu().numpy()[0], center_target.cpu().numpy()[0])
+            print(f"  > Layer {layer_idx + 1} Done. Center View PSNR: {p:.2f} dB")
+            
     # ---------------- Phase 2: Global Finetuning (Full Unfreeze) ----------------
     print(f"\n{'=' * 20} Phase 2: Global Finetuning (Full Unfreeze & Batch 10) {'=' * 20}")
 
@@ -432,7 +446,7 @@ def main_final_optimized():
         backbone_params += list(blk.desc_act.parameters())  # SA 的参数 (如PReLU)
     backbone_params += list(final_net.output_head.parameters())
 
-    main_lr = 0.0035
+    main_lr = 0.005
     optimizer_mod = torch.optim.Adam([
         {'params': mod_params, 'lr': main_lr * 2},  # Modulator 强力更新
         {'params': backbone_params, 'lr': main_lr}  # Backbone 微调
