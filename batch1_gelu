@@ -1,0 +1,523 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import copy
+import os
+import matplotlib.pyplot as plt
+from PIL import Image
+from collections import Counter
+
+from torch.nn import BatchNorm2d
+
+# 引入辅助模块
+from helpers import np_to_var, pil_to_np, psnr
+from mire_config import CONFIG
+from activations import ACT_DICT, get_activation_instance
+
+dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+
+
+# ==========================================
+# 0. 基础组件
+# ==========================================
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def conv_layer(in_f, out_f, kernel_size, stride=1, pad='reflection'):
+    padder = None
+    to_pad = int((kernel_size - 1) / 2)
+    if pad == 'reflection':
+        padder = nn.ReflectionPad2d(to_pad)
+        to_pad = 0
+    convolver = nn.Conv2d(in_f, out_f, kernel_size, stride, padding=to_pad, bias=False)
+    torch.nn.init.kaiming_normal_(convolver.weight, mode='fan_in', nonlinearity='relu')
+    layers = filter(lambda x: x is not None, [padder, convolver])
+    return nn.Sequential(*layers)
+
+
+# ==========================================
+# 1. Improved SA (保持不变)
+# ==========================================
+class ImprovedSelfAttentionAct(nn.Module):
+    def __init__(self, channels, d_model=64, num_heads=4, fixed_tau=0.6, pos_emb_scale=0.5):
+        super().__init__()
+        self.channels = channels
+        self.act_names = ACT_DICT
+        self.acts = nn.ModuleList([get_activation_instance(name) for name in self.act_names])
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.chan_pos_emb = nn.Parameter(torch.randn(1, channels, d_model) * pos_emb_scale)
+        self.embedding = nn.Linear(2 * len(self.act_names), d_model)
+        self.norm_pre = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+        self.fc = nn.Linear(d_model, len(self.act_names))
+        self.tau = fixed_tau
+        self.is_fixed = False
+        self.register_buffer('fixed_indices', torch.zeros(channels, dtype=torch.long))
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.orthogonal_(self.embedding.weight)
+        nn.init.orthogonal_(self.fc.weight)
+        nn.init.constant_(self.fc.bias, 0)
+
+    def _get_logits(self, x):
+        b, c, h, w = x.shape
+        act_outputs = [act(x) for act in self.acts]
+        stats_list = []
+        for out in act_outputs:
+            feat_avg = self.avg_pool(out).view(b, c)
+            feat_std = torch.std(out, dim=(2, 3)).view(b, c)
+            stats_list.append(torch.cat([feat_avg, feat_std], dim=1))
+        channel_features = torch.stack(stats_list, dim=2).view(b, c, -1)
+        tokens = self.embedding(channel_features) + self.chan_pos_emb
+        tokens = self.norm_pre(tokens)
+        attn_out, _ = self.self_attn(tokens, tokens, tokens)
+        logits = self.fc(tokens + attn_out)
+        return logits, act_outputs
+
+    def forward(self, x):
+        if self.is_fixed: return self._apply_hard(x)
+        logits, act_outputs = self._get_logits(x)
+        if self.training:
+            weights = F.gumbel_softmax(logits, tau=self.tau, hard=False, dim=2)
+        else:
+            weights = F.softmax(logits, dim=2)
+        output = 0
+        for k, out_k in enumerate(act_outputs):
+            w_k = weights[:, :, k].view(x.shape[0], x.shape[1], 1, 1)
+            output = output + w_k * out_k
+        return output
+
+    def fix_selection(self, x_sample):
+        self.eval()
+        with torch.no_grad():
+            logits, _ = self._get_logits(x_sample)
+            if logits.shape[0] == 1:
+                self.fixed_indices = torch.argmax(logits[0], dim=1)
+            else:
+                self.fixed_indices = torch.argmax(logits.mean(dim=0), dim=1)
+        self.is_fixed = True
+        return self.fixed_indices
+
+    def _apply_hard(self, x):
+        out = torch.zeros_like(x)
+        for k, act_layer in enumerate(self.acts):
+            idx = (self.fixed_indices == k).nonzero(as_tuple=True)[0]
+            if len(idx) > 0:
+                out.index_copy_(1, idx, act_layer(x.index_select(1, idx)))
+        return out
+
+
+# ==========================================
+# 2. Modulator & Hybrid Block
+# ==========================================
+class ModulatorBank(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, u_views=2, v_views=2):
+        super().__init__()
+        assert out_channels == 2
+        self.k = kernel_size
+        self.pad = int((kernel_size - 1) / 2)
+        self.kernels_u = nn.Parameter(torch.randn(u_views, 1, in_channels, kernel_size, kernel_size))
+        self.kernels_v = nn.Parameter(torch.randn(v_views, 1, in_channels, kernel_size, kernel_size))
+        nn.init.normal_(self.kernels_u, std=0.01)
+        nn.init.normal_(self.kernels_v, std=0.01)
+
+    def forward(self, x, u_idx, v_idx):
+        B = x.shape[0]
+        results = []
+        x_pad = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='reflect')
+        for i in range(B):
+            k_u = self.kernels_u[u_idx[i]]
+            k_v = self.kernels_v[v_idx[i]]
+            active_kernel = torch.cat([k_u, k_v], dim=0)
+            out_i = F.conv2d(x_pad[i:i + 1], active_kernel)
+            results.append(out_i)
+        return torch.cat(results, dim=0)
+
+
+class HybridBlock(nn.Module):
+    def __init__(self, in_channels, out_channels=64, upsample=True):
+        super().__init__()
+        self.mod_ch = 2
+        self.desc_ch = out_channels - 2
+        self.enable_modulator = False
+
+        self.desc_conv = conv_layer(in_channels, self.desc_ch, 3)
+        self.desc_bn = nn.BatchNorm2d(self.desc_ch, affine=True)
+        # self.desc_act = ImprovedSelfAttentionAct(channels=self.desc_ch)
+        self.desc_act = nn.GELU()
+
+        self.mod_conv = ModulatorBank(in_channels, self.mod_ch, 3, u_views=2, v_views=2)
+        
+        # self.mod_bn = nn.BatchNorm2d(self.mod_ch, affine=True)
+        # 修复：用 GroupNorm 替代 BatchNorm，解决归一化问题
+        # GroupNorm 的统计量只在单个样本内计算，与 batch size 完全无关
+        self.mod_bn = nn.GroupNorm(num_groups=1, num_channels=self.mod_ch, affine=True)
+        self.mod_act = nn.GELU()
+
+        self.upsample = upsample
+        if upsample:
+            self.up_layer = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+    def forward(self, x, u_idx, v_idx):
+        out_desc = self.desc_conv(x)
+        out_desc = self.desc_bn(out_desc)
+        if self.upsample: out_desc = self.up_layer(out_desc)
+        out_desc = self.desc_act(out_desc)
+
+        if self.enable_modulator:
+            out_mod = self.mod_conv(x, u_idx, v_idx)
+            out_mod = self.mod_bn(out_mod)
+            if self.upsample: out_mod = self.up_layer(out_mod)
+            out_mod = self.mod_act(out_mod)
+        else:
+            b, _, h, w = out_desc.shape
+            out_mod = torch.zeros(b, self.mod_ch, h, w, device=x.device, dtype=x.dtype)
+
+        return torch.cat([out_desc, out_mod], dim=1)
+
+    def get_act_input(self, x, u_idx, v_idx):
+        out = self.desc_conv(x)
+        out = self.desc_bn(out)
+        if self.upsample:
+            out = self.up_layer(out)
+        return out
+
+
+# ==========================================
+# 3. Decoders
+# ==========================================
+class GrowingDecoder(nn.Module):
+    def __init__(self, fixed_blocks, candidate_block, out_channels=3, target_size=(512, 512)):
+        super().__init__()
+        self.fixed_blocks = nn.ModuleList(fixed_blocks)
+        self.candidate_block = candidate_block
+        self.target_size = target_size
+        curr_ch = CONFIG['k_channels']
+        self.adapter = nn.Sequential(
+            conv_layer(curr_ch, out_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, u_idx, v_idx):
+        out = x
+        for blk in self.fixed_blocks:
+            out = blk(out, u_idx, v_idx)
+        out = self.candidate_block(out, u_idx, v_idx)
+        out = self.adapter(out)
+        if out.shape[2:] != self.target_size:
+            out = F.interpolate(out, size=self.target_size, mode='bilinear', align_corners=False)
+        return out
+
+    def set_modulator_status(self, status):
+        for blk in self.fixed_blocks:
+            blk.enable_modulator = status
+            if not status:
+                blk.mod_bn.eval()
+            else:
+                blk.mod_bn.train()
+        self.candidate_block.enable_modulator = status
+        if not status:
+            self.candidate_block.mod_bn.eval()
+        else:
+            self.candidate_block.mod_bn.train()
+
+
+class FinalDecoder(nn.Module):
+    def __init__(self, blocks, last_channels, out_channels=3):
+        super().__init__()
+        self.main_body = nn.ModuleList(blocks)
+        self.output_head = nn.Sequential(
+            conv_layer(last_channels, out_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, u_idx, v_idx):
+        out = x
+        for blk in self.main_body:
+            out = blk(out, u_idx, v_idx)
+        return self.output_head(out)
+
+    def set_modulator_status(self, status):
+        for blk in self.main_body:
+            blk.enable_modulator = status
+            if not status:
+                blk.mod_bn.eval()
+            else:
+                blk.mod_bn.train()
+
+
+# ==========================================
+# 4. Data Loading
+# ==========================================
+def load_lf_images(base_path, h=9, w=9):
+    images = {}
+    print(f"Loading Light Field from {base_path}...")
+    count = 0
+    for u in range(h):
+        for v in range(w):
+            fname = f"lf_{u + 1}_{v + 1}.png"
+            path = os.path.join(base_path, fname)
+            if not os.path.exists(path):
+                fname = f"boxes_{u}_{v}.png"
+                path = os.path.join(base_path, fname)
+
+            if os.path.exists(path):
+                img = Image.open(path).convert('RGB')
+                img_np = pil_to_np(img)
+                if img_np.shape[1] > 512: img_np = img_np[:, :512, :512]
+                images[(u, v)] = np_to_var(img_np).type(dtype)
+                count += 1
+    print(f"Loaded {count} images to VRAM dictionary.")
+    return images
+
+
+# ==========================================
+# 5. Main Procedure (Batch 1 + Same Total Image Exposure)
+# ==========================================
+def main_final_optimized():
+    scene_name = "boxes"
+    data_path = "data/boxes"
+    # 修改了存储路径
+    save_dir = f'outputs/batch1_{scene_name}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    k_channels = CONFIG['k_channels']
+    balanced_schedule = [(800, 2200), (600, 2400), (800, 2200), (1200, 2300), (1000, 3000)]
+    upsample_configs = [True, True, True, True, False]
+
+    # === [修改 1：设置 Batch Size 为 1] ===
+    BATCH_SIZE = 1
+
+    lf_data = load_lf_images(data_path, h=2, w=2)
+    view_keys = list(lf_data.keys())  # 所有的 (u, v)，一共 4 个
+    TOTAL_VIEWS = len(view_keys)
+
+    first_target = lf_data[view_keys[0]]
+    target_h, target_w = first_target.shape[2], first_target.shape[3]
+
+    print(f"Total Views: {TOTAL_VIEWS}, Training Batch Size: {BATCH_SIZE}")
+
+    noise_file = CONFIG['noise_file']
+    if os.path.exists(noise_file):
+        net_input = torch.load(noise_file).type(dtype)
+    else:
+        net_input = torch.zeros(1, k_channels, 32, 32).type(dtype)
+        net_input.data.uniform_() * 0.1
+
+    # === [修改：不需要 repeat 到 4 份了，保持 Batch = 1 的大小即可] ===
+    net_input_saved = net_input.data.clone()  # [1, C, 32, 32]
+
+    fixed_blocks = []
+    last_head = None
+    device = first_target.device
+    mse = nn.MSELoss()
+
+    # ---------------- Phase 1: Growing ----------------
+    print(f"\n{'=' * 20} Phase 1: Layer-wise Growing (SA + Batch 1) {'=' * 20}")
+
+    center_idx = TOTAL_VIEWS // 2
+    center_u, center_v = view_keys[center_idx]
+    print(f"Phase 1 will search architecture ONLY on Center View: ({center_u}, {center_v})")
+
+    # Phase 1 只需要 1 个视角的输入
+    b_u_center = torch.tensor([center_u], dtype=torch.long, device=device)
+    b_v_center = torch.tensor([center_v], dtype=torch.long, device=device)
+    center_target = lf_data[(center_u, center_v)]  # 形状已经是 [1, 3, H, W]
+
+    for layer_idx, (upsample, (n_search, n_refine)) in enumerate(zip(upsample_configs, balanced_schedule)):
+        print(f"\n[Layer {layer_idx + 1}] Search: {n_search} | Refine: {n_refine}")
+
+        for blk in fixed_blocks:
+            for p in blk.parameters(): p.requires_grad = True
+            blk.desc_bn.train()
+
+        cand = HybridBlock(k_channels, k_channels, upsample=upsample)
+        net = GrowingDecoder(fixed_blocks, cand, 3, (target_h, target_w)).type(dtype)
+
+        net.set_modulator_status(False)
+        optimizer = torch.optim.Adam(net.parameters(), lr=CONFIG['search_lr'])
+        net.train()
+
+        # --- 1.1 Search ---
+        for i in range(n_search):
+            optimizer.zero_grad()
+            # 【精简】：因为净输入就是 batch=1，不需要写 [0:1] 了
+            out = net(net_input_saved, b_u_center, b_v_center)
+            loss = mse(out, center_target)
+            loss.backward()
+            optimizer.step()
+
+            if i % 200 == 0:
+                print(f"    Search Step {i}/{n_search} - Loss: {loss.item():.6f}")
+        '''
+        # --- 1.2 Fix Selection ---
+        with torch.no_grad():
+            net.eval()
+            x_f = net_input_saved
+            for blk in net.fixed_blocks: x_f = blk(x_f, b_u_center, b_v_center)
+            act_input = cand.get_act_input(x_f, b_u_center, b_v_center)
+            cand.desc_act.fix_selection(act_input)
+
+            c = Counter([cand.desc_act.act_names[idx] for idx in cand.desc_act.fixed_indices.cpu().numpy()])
+            print(f"  > Layer {layer_idx + 1} Selection: {dict(c)}")
+            net.train()
+        '''
+        # --- 1.3 Refine ---
+        for pg in optimizer.param_groups: pg['lr'] = CONFIG['search_lr'] * 0.8
+        for i in range(n_refine):
+            optimizer.zero_grad()
+            out = net(net_input_saved, b_u_center, b_v_center)
+            loss = mse(out, center_target)
+            loss.backward()
+            optimizer.step()
+
+            if i % 500 == 0:
+                print(f"    Refine Step {i}/{n_refine} - Loss: {loss.item():.6f}")
+
+        fixed_blocks.append(net.candidate_block)
+        last_head = copy.deepcopy(net.adapter)
+
+        # 验证
+        with torch.no_grad():
+            out = net(net_input_saved, b_u_center, b_v_center)
+            p = psnr(out.cpu().numpy()[0], center_target.cpu().numpy()[0])
+            print(f"  > Layer {layer_idx + 1} Done. Center View PSNR: {p:.2f} dB")
+
+    # ---------------- Phase 2: Global Finetuning (Full Unfreeze) ----------------
+    print(f"\n{'=' * 20} Phase 2: Global Finetuning (Batch 1) {'=' * 20}")
+
+    final_net = FinalDecoder(fixed_blocks, k_channels, 3).type(dtype)
+    if last_head:
+        final_net.output_head[0][-1].weight.data = last_head[0][-1].weight.data.clone()
+        if last_head[0][-1].bias is not None:
+            final_net.output_head[0][-1].bias.data = last_head[0][-1].bias.data.clone()
+
+    final_net.set_modulator_status(True)
+
+    # ==========================================
+    # 新增：Modulator 零初始化 (Zero-Init)
+    # ==========================================
+    for blk in final_net.main_body:
+        # 将 Modulator 的 BN 层的 weight(gamma) 初始化为 0
+        nn.init.constant_(blk.mod_bn.weight, 0)
+        nn.init.constant_(blk.mod_bn.bias, 0)
+    # ==========================================
+
+    for p in final_net.parameters():
+        p.requires_grad = True
+
+    final_net.train()
+
+    # === [修改 2：使用统一的相同的学习率] ===
+    main_lr = 0.03
+    # 4. 差异化学习率
+    mod_params = []
+    backbone_params = []
+    for blk in final_net.main_body:
+        mod_params += list(blk.mod_conv.parameters())
+        mod_params += list(blk.mod_bn.parameters())  # 加上 BN 参数
+        backbone_params += list(blk.desc_conv.parameters())
+        backbone_params += list(blk.desc_bn.parameters())
+        # backbone_params += list(blk.desc_act.parameters())  # SA 的参数
+    backbone_params += list(final_net.output_head.parameters())
+
+    main_lr = 0.03
+    optimizer_mod = torch.optim.Adam([
+        {'params': mod_params, 'lr': main_lr},
+        {'params': backbone_params, 'lr': main_lr}
+    ])
+
+    # === [修改 3：迭代次数和 Milestone 放大 4 倍] ===
+    # 之前是 batch=4, 迭代 80,000 次，等于总共学了 320,000 次。
+    # 现在 batch=1，要保证每张图的训练次数完全一致，需要乘 4
+    TOTAL_STEPS = 80000 * TOTAL_VIEWS  # = 320000
+    # milestones = [m * TOTAL_VIEWS for m in [25000, 45000, 65000]]  # [100000, 180000, 260000]
+
+    print(f"  > Training for {TOTAL_STEPS} steps to match previous per-view exposure...")
+
+    best_avg_psnr = 0.0
+    best_state = None
+    history_psnr = []
+
+    ACCUM_STEPS = TOTAL_VIEWS  # 4
+
+    optimizer_mod.zero_grad()
+    for step in range(TOTAL_STEPS):
+        view_idx = step % TOTAL_VIEWS
+        u, v = view_keys[view_idx]
+        target_img = lf_data[(u,v)]
+        u_t = torch.tensor([u], dtype=torch.long, device=device)
+        v_t = torch.tensor([v], dtype=torch.long, device=device)
+
+        out = final_net(net_input_saved, u_t, v_t)
+        loss = mse(out, target_img) / ACCUM_STEPS  # ← 缩放梯度
+        loss.backward()
+
+        if (step + 1) % ACCUM_STEPS == 0:  # ← 攒够 4 个视角再更新
+            torch.nn.utils.clip_grad_norm_(final_net.parameters(), max_norm=1.0)
+            optimizer_mod.step()
+            optimizer_mod.zero_grad()  # ← 此时所有 kernel 都有正确梯度
+
+        # === [修改：为了评估准确，每 2000 次（对应batch=4的500次）计算一次平均 PSNR，而不是单张图] ===
+        if step % 2000 == 0:
+            final_net.eval()
+            with torch.no_grad():
+                current_psnr_sum = 0
+                for (eval_u, eval_v) in view_keys:
+                    t_img = lf_data[(eval_u, eval_v)]
+                    eu_t = torch.tensor([eval_u], dtype=torch.long, device=device)
+                    ev_t = torch.tensor([eval_v], dtype=torch.long, device=device)
+                    eval_out = final_net(net_input_saved, eu_t, ev_t)
+                    current_psnr_sum += psnr(eval_out.cpu().numpy()[0], t_img.cpu().numpy()[0])
+
+                avg_psnr = current_psnr_sum / TOTAL_VIEWS
+
+            history_psnr.append(avg_psnr)
+            print(
+                f"  Step {step:06d}/{TOTAL_STEPS} - Cur View Loss: {loss.item():.6f} | Avg Eval PSNR: {avg_psnr:.2f} dB")
+
+            if avg_psnr > best_avg_psnr:
+                best_avg_psnr = avg_psnr
+                best_state = copy.deepcopy(final_net.state_dict())
+
+            final_net.train()
+
+    print(f"Training Done. Best Validated Avg PSNR: {best_avg_psnr:.2f} dB")
+
+    # === Evaluation ===
+    if best_state:
+        final_net.load_state_dict(best_state)
+
+    final_net.eval()
+    avg_psnr = 0
+    with torch.no_grad():
+        for (u, v) in view_keys:
+            target = lf_data[(u, v)]
+            eval_u = torch.tensor([u], dtype=torch.long, device=device)
+            eval_v = torch.tensor([v], dtype=torch.long, device=device)
+
+            out = final_net(net_input_saved, eval_u, eval_v)
+            p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
+            avg_psnr += p
+
+            plt.imsave(os.path.join(save_dir, f"recon_{u}_{v}.png"),
+                       np.clip(out.cpu().numpy()[0].transpose(1, 2, 0), 0, 1))
+
+    print(f"Final Average PSNR: {avg_psnr / TOTAL_VIEWS:.2f} dB")
+
+    plt.figure()
+    plt.plot(history_psnr)
+    plt.title("Phase 2 Learning Curve (Batch1)")
+    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
+
+
+if __name__ == "__main__":
+    seed_everything(42)
+    main_final_optimized()
