@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from collections import Counter
 
+from torch.amp import autocast  # 新增，用于半精度训练
+
 # 引入辅助模块
 from helpers import np_to_var, pil_to_np, psnr
 from mire_config import CONFIG
@@ -25,6 +27,7 @@ from activations import ACT_DICT, get_activation_instance
 ###############################################################################
 
 dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+
 
 def spiral_order(angular_resolution):
     position_list = []
@@ -46,6 +49,7 @@ def spiral_order(angular_resolution):
         position_list.append([angular_resolution // 2 + 1, angular_resolution // 2 + 1])
     return position_list
 
+
 # ==========================================
 # 0. 基础组件
 # ==========================================
@@ -63,7 +67,8 @@ def conv_layer(in_f, out_f, kernel_size, dilation, stride=1, pad='reflection'):
     if pad == 'reflection':
         padder = nn.ReflectionPad2d(to_pad)
         to_pad = 0
-    convolver = nn.Conv2d(in_f, out_f, kernel_size, stride, padding='same', bias=False, dilation=dilation)   # Jinglei: 1. 这里padding直接用“same"即可   5.这里添加了dilation，分别为[1,2,2,2,1]
+    convolver = nn.Conv2d(in_f, out_f, kernel_size, stride, padding='same', bias=False,
+                          dilation=dilation)  # Jinglei: 1. 这里padding直接用“same"即可   5.这里添加了dilation，分别为[1,2,2,2,1]
     torch.nn.init.kaiming_normal_(convolver.weight, mode='fan_in', nonlinearity='relu')
     # layers = filter(lambda x: x is not None, [padder, convolver])
     layers = filter(lambda x: x is not None, [convolver])
@@ -154,7 +159,8 @@ class ModulatorBank(nn.Module):
         self.pad = int((kernel_size - 1) / 2)
         self.kernels_u = nn.Parameter(torch.randn(u_views, 1, in_channels, kernel_size, kernel_size))
         self.kernels_v = nn.Parameter(torch.randn(v_views, 1, in_channels, kernel_size, kernel_size))
-        torch.nn.init.kaiming_normal_(self.kernels_u, mode='fan_in', nonlinearity='relu')       # Jinglei: 2. 这里我稍微改了一下初始化方法，不过对性能影响不大
+        torch.nn.init.kaiming_normal_(self.kernels_u, mode='fan_in',
+                                      nonlinearity='relu')  # Jinglei: 2. 这里我稍微改了一下初始化方法，不过对性能影响不大
         torch.nn.init.kaiming_normal_(self.kernels_v, mode='fan_in', nonlinearity='relu')
         # nn.init.normal_(self.kernels_u, std=0.01)
         # nn.init.normal_(self.kernels_v, std=0.01)
@@ -176,24 +182,25 @@ class HybridBlock(nn.Module):
         self.enable_modulator = False
 
         self.desc_conv = conv_layer(in_channels, self.desc_ch, 3, dilation)
-        self.desc_bn = nn.BatchNorm2d(out_channels) #nn.BatchNorm2d(self.desc_ch, affine=True)
+        self.desc_bn = nn.BatchNorm2d(out_channels)  # nn.BatchNorm2d(self.desc_ch, affine=True)
         # self.batch_norm = nn.BatchNorm2d(out_channels)
         # 依然使用 SA
-        self.desc_act = nn.GELU() #ImprovedSelfAttentionAct(channels=self.desc_ch)
+        self.desc_act = nn.GELU()  # ImprovedSelfAttentionAct(channels=self.desc_ch)
 
         self.mod_conv = ModulatorBank(in_channels, self.mod_ch, 3)
         self.mod_act = nn.GELU()
 
         self.upsample = upsample
         if upsample:
-            self.up_layer = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)    # 4. Jinglei: upsampling方法用bicubic，更加准确
+            self.up_layer = nn.Upsample(scale_factor=2, mode='bicubic',
+                                        align_corners=False)  # 4. Jinglei: upsampling方法用bicubic，更加准确
 
     def forward(self, x, u_idx, v_idx):
         # up batch act
         out_desc = self.desc_conv(x)
         # out_desc = self.desc_bn(out_desc)
         # if self.upsample: out_desc = self.up_layer(out_desc)
-        out_desc = self.desc_act(out_desc)
+        # out_desc = self.desc_act(out_desc)
 
         if self.enable_modulator:
             out_mod = self.mod_conv(x, u_idx, v_idx)
@@ -204,7 +211,7 @@ class HybridBlock(nn.Module):
 
         out_put = torch.cat([out_desc, out_mod], dim=1)
         if self.upsample: out_put = self.up_layer(out_put)
-        out_put = self.desc_bn(out_put)                     # 3. Jinglei: 这里，我简单使用了 concat - bn - act的形式，后面我们根据需要调整
+        out_put = self.desc_bn(out_put)  # 3. Jinglei: 这里，我简单使用了 concat - bn - act的形式，后面我们根据需要调整
         out_put = self.mod_act(out_put)
 
         return out_put
@@ -234,7 +241,8 @@ class GrowingDecoder(nn.Module):
         out = self.candidate_block(out, u_idx, v_idx)
         out = self.adapter(out)
         if out.shape[2:] != self.target_size:
-            out = F.interpolate(out, size=self.target_size, mode='bicubic', align_corners=False)  # 4. Jinglei: upsampling方法用bicubic，更加准确
+            out = F.interpolate(out, size=self.target_size, mode='bicubic',
+                                align_corners=False)  # 4. Jinglei: upsampling方法用bicubic，更加准确
         return out
 
     def set_modulator_status(self, status):
@@ -296,14 +304,14 @@ def load_lf_images(base_path, h=9, w=9):
 def main_final_optimized():
     scene_name = "boxes"
     data_path = "data/boxes"
-    save_dir = f'outputs/sa_batch20_fullunfreeze_{scene_name}'
+    save_dir = f'outputs/backbone_{scene_name}'
     os.makedirs(save_dir, exist_ok=True)
 
     k_channels = CONFIG['k_channels']
     # balanced_schedule = [(600, 2400), (800, 2200), (600, 2400), (1000, 2500), (800, 3200)]
-    balanced_schedule = [(10, 20), (10, 20), (10, 20), (10, 20), (10, 20)]                      # Jinglei: 这里需要调整回去
+    balanced_schedule = [(10, 20), (10, 20), (10, 20), (10, 20), (10, 20)]  # Jinglei: 这里需要调整回去
     upsample_configs = [True, True, True, True, False]
-    dilations = [1,2,2,2,1]                                                                     # Jinglei: 这里是我设置的各层dilation
+    dilations = [1, 2, 2, 2, 1]  # Jinglei: 这里是我设置的各层dilation
 
     # === [设置 Batch Size] ===
     BATCH_SIZE = 81
@@ -334,7 +342,8 @@ def main_final_optimized():
     # ---------------- Phase 1: Growing ----------------
     print(f"\n{'=' * 20} Phase 1: Layer-wise Growing (SA + Batch 20) {'=' * 20}")
 
-    for layer_idx, (upsample, (n_search, n_refine),dilation) in enumerate(zip(upsample_configs, balanced_schedule, dilations)):
+    for layer_idx, (upsample, (n_search, n_refine), dilation) in enumerate(
+            zip(upsample_configs, balanced_schedule, dilations)):
         print(f"\n[Layer {layer_idx + 1}] Search: {n_search} | Refine: {n_refine}")
 
         for blk in fixed_blocks:
@@ -349,6 +358,7 @@ def main_final_optimized():
         optimizer = torch.optim.Adam(net.parameters(), lr=CONFIG['search_lr'])
         net.train()
 
+
         # === Phase 1.1 Search ===
         for i in range(n_search):
             if CONFIG['reg_noise_std'] > 0:
@@ -357,7 +367,7 @@ def main_final_optimized():
             else:
                 ni = net_input_saved
 
-            accum_loss = 0.0
+            # accum_loss = 0.0
 
             # 随机采样 20 个索引
             batch_indices = torch.randperm(TOTAL_VIEWS)[:BATCH_SIZE]
@@ -367,13 +377,12 @@ def main_final_optimized():
                 target = lf_data[(u, v)]  # 从字典中取 Tensor
 
                 optimizer.zero_grad()
-                out = net(ni, u, v)
-                loss = mse(out, target) / BATCH_SIZE
+                with autocast('cuda',dtype=torch.bfloat16):  # ← 包裹前向和 loss
+                    out = net(ni, u, v)
+                    loss = mse(out, target) / BATCH_SIZE
                 loss.backward()
-                # accum_loss += loss.item()
 
             optimizer.step()
-
             if i % 100 == 0:
                 print(f"    Search Step {i}/{n_search} - Avg Batch Loss: {loss:.6f}")
 
@@ -388,6 +397,7 @@ def main_final_optimized():
         #     print(f"  > Layer {layer_idx + 1} Selection: {dict(c)}")
 
         # === Phase 1.2 Refine ===
+
         for pg in optimizer.param_groups: pg['lr'] = CONFIG['search_lr'] * 0.8
         for i in range(n_refine):
             accum_loss = 0.0
@@ -398,12 +408,10 @@ def main_final_optimized():
                 target = lf_data[(u, v)]
 
                 optimizer.zero_grad()
-                out = net(net_input_saved, u, v)
-                loss = mse(out, target) #/ BATCH_SIZE                       # Jinglei: 这里不要除以batch size会降低学习率。同时我改成单张图片反向优化一次，为了和之前论文保持一致
+                with autocast('cuda',dtype=torch.bfloat16):
+                    out = net(net_input_saved, u, v)
+                    loss = mse(out, target)
                 loss.backward()
-                accum_loss += loss
-                # accum_loss += loss.item()
-
                 optimizer.step()
             if i % 500 == 0:
                 print(f"    Refine Step {i}/{n_refine} - Avg Batch Loss: {accum_loss:.6f}")
@@ -448,25 +456,26 @@ def main_final_optimized():
         backbone_params += list(blk.desc_act.parameters())  # SA 的参数 (如PReLU)
     backbone_params += list(final_net.output_head.parameters())
 
-    main_lr = 0.005                                                                      # Jinglei: 我稍微试了大一点的学习率，可以调小为0.003
+    main_lr = 0.005  # Jinglei: 我稍微试了大一点的学习率，可以调小为0.003
     optimizer_mod = torch.optim.Adam([
         {'params': mod_params, 'lr': main_lr},  # Modulator 强力更新
         {'params': backbone_params, 'lr': main_lr}],  # Backbone 微调
-        betas=(0.9, 0.99),                                                               # Jinglei: 这里我细化了一下，对结果影响不大
+        betas=(0.9, 0.99),  # Jinglei: 这里我细化了一下，对结果影响不大
         eps=1e-14,
     )
 
-    TOTAL_STEPS = 500*5*10 
+    TOTAL_STEPS = 500 * 5 * 10
     print(f"  > Training for {TOTAL_STEPS} steps...")
 
     best_avg_psnr = 0.0
     best_state = None
     history_psnr = []
 
-    lf_order = spiral_order(9)                                                           # Jinglei: 采用螺旋扫描方式
+    lf_order = spiral_order(9)  # Jinglei: 采用螺旋扫描方式
 
     for step in range(TOTAL_STEPS):
-        if step in [500*5*3, 500*5*6, 500*5*9]:#[25000, 45000, 65000]:                   # Jinglei: 我把TOTAL_STEPS写成a*b*c的形式，可以调整c控制阶段
+        if step in [500 * 5 * 3, 500 * 5 * 6,
+                    500 * 5 * 9]:  # [25000, 45000, 65000]:                   # Jinglei: 我把TOTAL_STEPS写成a*b*c的形式，可以调整c控制阶段
             for pg in optimizer_mod.param_groups: pg['lr'] *= 0.5
             print(f"    LR Decay at step {step}")
 
@@ -476,18 +485,25 @@ def main_final_optimized():
         # batch_indices = torch.randperm(TOTAL_VIEWS)[:BATCH_SIZE]
         # print("U V is", batch_indices) # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # batch_indices = torch.randperm(81)[:5]
-        for [u_org, v_org] in lf_order:                                                 # Jinglei: 不要随机化，直接用spiral order扫描
-            u, v = u_org-1, v_org-1                                                     # 光场图片下标是从1开始的，所以要-1
-            
+        for [u_org, v_org] in lf_order:  # Jinglei: 不要随机化，直接用spiral order扫描
+            u, v = u_org - 1, v_org - 1  # 光场图片下标是从1开始的，所以要-1
 
             target = lf_data[(u, v)]
 
             optimizer_mod.zero_grad()
+            with autocast('cuda', dtype=torch.bfloat16):    # ← BF16，不需要 scaler
+                out = final_net(net_input_saved, u, v)
+                loss = mse(out, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(final_net.parameters(), clip_value=0.5)
+            '''
             out = final_net(net_input_saved, u, v)
-            loss = mse(out, target) #/ BATCH_SIZE  
-            loss.backward()  # 先backward再clip
-            torch.nn.utils.clip_grad_value_(final_net.parameters(), clip_value=0.5)    # Jinglei: 我把梯度剪裁改成按value进行剪裁了
+            loss = mse(out, target)  # / BATCH_SIZE
+            torch.nn.utils.clip_grad_value_(final_net.parameters(), clip_value=0.5)  # Jinglei: 我把梯度剪裁改成按value进行剪裁了
+            loss.backward()
+            '''
             optimizer_mod.step()
+
             # accum_loss += loss.item()
 
         # 梯度裁剪
@@ -502,10 +518,13 @@ def main_final_optimized():
                 psnr_list = []
                 for (u, v) in view_keys:
                     target = lf_data[(u, v)]
-                    out = final_net(net_input_saved, u, v)
-                    p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
+                    with autocast('cuda',dtype=torch.bfloat16):  # ← 加上这个
+                        out = final_net(net_input_saved, u, v)
+                    p = psnr(out.float().cpu().numpy()[0], target.cpu().numpy()[0])
+                    # out = final_net(net_input_saved, u, v)
+                    # p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
                     psnr_list.append(p)
-                avg_psnr = np.mean(psnr_list)                                          # Jinglei: PSNR 平均可以用List来算
+                avg_psnr = np.mean(psnr_list)  # Jinglei: PSNR 平均可以用List来算
                 print(f"  Step {step}/{TOTAL_STEPS} - Est. PSNR: {avg_psnr:.2f} dB")
             if avg_psnr > best_avg_psnr:
                 best_avg_psnr = avg_psnr
@@ -517,14 +536,17 @@ def main_final_optimized():
     if best_state:
         final_net.load_state_dict(best_state)
 
+    # final_net.train()
     final_net.eval()
     avg_psnr = 0
     with torch.no_grad():
         for (u, v) in view_keys:
             target = lf_data[(u, v)]
-            out = final_net(net_input_saved, u, v)
+            with autocast('cuda',dtype=torch.bfloat16):  # ← 评估也用 autocast 保持一致
+                out = final_net(net_input_saved, u, v)
+            out = out.float()  # ← 统一转 FP32
             p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
-            avg_psnr += p
+            avg_psnr += p  # ← 用 avg_psnr 而非 psnr_list
 
             plt.imsave(os.path.join(save_dir, f"recon_{u}_{v}.png"),
                        np.clip(out.cpu().numpy()[0].transpose(1, 2, 0), 0, 1))
