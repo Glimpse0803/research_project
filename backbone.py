@@ -485,8 +485,8 @@ def main_final_optimized():
             optimizer_mod.zero_grad()
             out = final_net(net_input_saved, u, v)
             loss = mse(out, target) #/ BATCH_SIZE  
+            loss.backward()  # 先backward再clip
             torch.nn.utils.clip_grad_value_(final_net.parameters(), clip_value=0.5)    # Jinglei: 我把梯度剪裁改成按value进行剪裁了
-            loss.backward()
             optimizer_mod.step()
             # accum_loss += loss.item()
 
