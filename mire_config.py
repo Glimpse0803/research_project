@@ -21,6 +21,9 @@ CONFIG = {
     # --- 文件路径 ---
     'noise_file': 'fixed_noise_k64_32x32.pt',  # 固定噪声文件
     'img_path': 'data/boxes_5_5.png',
-    'img_dir': 'data/boxes'
+    'img_dir': 'data/boxes',
+
+    # --- 卷积层通道数调整 (控制参数量) ---
+    'branch_channels': 140
 
 }

@@ -14,6 +14,9 @@ from torch.amp import autocast  # 新增，用于半精度训练
 from helpers import np_to_var, pil_to_np, psnr
 from mire_config import CONFIG
 from activations import ACT_DICT, get_activation_instance
+from conv_layer import asy_dir_conv_block
+from frequency import frequency_analysis
+from conv_layer import DirectionalConv2d
 
 ###############################################################################
 ################### 参考性能（可训练参数量 -- PSNR）, 81张图，boxes ###############
@@ -49,9 +52,8 @@ def spiral_order(angular_resolution):
         position_list.append([angular_resolution // 2 + 1, angular_resolution // 2 + 1])
     return position_list
 
-
 # ==========================================
-# 0. 基础组件
+# 0. 基础组件 + 预处理函数
 # ==========================================
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -74,6 +76,66 @@ def conv_layer(in_f, out_f, kernel_size, dilation, stride=1, pad='reflection'):
     layers = filter(lambda x: x is not None, [convolver])
     return nn.Sequential(*layers)
 
+def pretreatment(lf_data, branch_channels):
+    ratio_list = []
+    channel_list = []
+
+    ratio_list = frequency_analysis(lf_data)
+
+    for i in range(3):
+        channel_list.append(round(branch_channels * ratio_list[i]))
+
+    channel_list.append(branch_channels - sum(channel_list))
+
+    return channel_list
+
+
+def count_model_parameters(model):
+    total_params = 0
+    effective_params = 0
+    
+    # 记录已经处理过的参数对象 ID，防止在复杂网络结构中重复计数
+    seen_params = set()
+
+    # 遍历所有子模块
+    for name, module in model.named_modules():
+        # 如果是 DirectionalConv2d，执行特殊逻辑
+        if isinstance(module, DirectionalConv2d):
+            # 处理卷积权重 (weight)
+            p = module.conv.weight
+            if id(p) not in seen_params:
+                p_total = p.numel()
+                # 有效参数 = 激活的 mask 点数 * 输入通道 * 输出通道
+                p_effective = module.effective_param_count()
+                
+                total_params += p_total
+                effective_params += p_effective
+                seen_params.add(id(p))
+            
+            # 处理卷积偏置 (bias) bias=False
+            if module.conv.bias is not None:
+                b = module.conv.bias
+                if id(b) not in seen_params:
+                    total_params += b.numel()
+                    effective_params += b.numel()
+                    seen_params.add(id(b))
+                    
+        # 对于非 DirectionalConv2d 的叶子节点模块（如普通的 Conv2d, Linear, BatchNorm）
+        # 我们只处理那些不再包含子模块的层，防止重复统计
+        elif len(list(module.children())) == 0:
+            for p_name, p in module.named_parameters(recurse=False):
+                if id(p) not in seen_params:
+                    total_params += p.numel()
+                    effective_params += p.numel()
+                    seen_params.add(id(p))
+
+    print("-" * 30)
+    print(f"总注册参数量 (Total):     {total_params:,}")
+    print(f"有效计算参数量 (Effective): {effective_params:,}")
+    print(f"减少的冗余参数:           {total_params - effective_params:,}")
+    print("-" * 30)
+    
+    return total_params, effective_params
 
 # ==========================================
 # 1. Improved SA (保持不变)
@@ -175,13 +237,15 @@ class ModulatorBank(nn.Module):
 
 
 class HybridBlock(nn.Module):
-    def __init__(self, in_channels, out_channels=64, upsample=True, dilation=1):
+    def __init__(self, channel_list, in_channels, out_channels=64, upsample=True, dilation=1):
+    # def __init__(self, in_channels, out_channels=64, upsample=True, dilation=1):
         super().__init__()
         self.mod_ch = 2
         self.desc_ch = out_channels - 2
         self.enable_modulator = False
 
-        self.desc_conv = conv_layer(in_channels, self.desc_ch, 3, dilation)
+        # self.desc_conv = conv_layer(in_channels, self.desc_ch, 3, dilation)
+        self.desc_conv = asy_dir_conv_block(in_channels,self.desc_ch,channel_list,'45','135', dilation=dilation)
         self.desc_bn = nn.BatchNorm2d(out_channels)  # nn.BatchNorm2d(self.desc_ch, affine=True)
         # self.batch_norm = nn.BatchNorm2d(out_channels)
         # 依然使用 SA
@@ -307,7 +371,13 @@ def main_final_optimized():
     save_dir = f'outputs/backbone_{scene_name}'
     os.makedirs(save_dir, exist_ok=True)
 
+    # 确保模型保存目录存在
+    model_save_dir = f'outputs/model_{scene_name}'
+    os.makedirs(model_save_dir, exist_ok=True)
+    best_model_path = os.path.join(model_save_dir, 'best_model.pth')
+
     k_channels = CONFIG['k_channels']
+    branch_channels = CONFIG['branch_channels']
     # balanced_schedule = [(600, 2400), (800, 2200), (600, 2400), (1000, 2500), (800, 3200)]
     balanced_schedule = [(10, 20), (10, 20), (10, 20), (10, 20), (10, 20)]  # Jinglei: 这里需要调整回去
     upsample_configs = [True, True, True, True, False]
@@ -335,9 +405,15 @@ def main_final_optimized():
         net_input.data.uniform_() * 0.1
     net_input_saved = net_input.data.clone()
 
+    # 预处理：计算卷积层各支路比例
+
     fixed_blocks = []
+    channel_list = []
     last_head = None
     mse = nn.MSELoss()
+
+    # 预处理：计算卷积层各支路比例
+    channel_list = pretreatment(lf_data, branch_channels)
 
     # ---------------- Phase 1: Growing ----------------
     print(f"\n{'=' * 20} Phase 1: Layer-wise Growing (SA + Batch 20) {'=' * 20}")
@@ -351,7 +427,8 @@ def main_final_optimized():
             blk.desc_bn.train()
             # blk.batch_norm.train()
 
-        cand = HybridBlock(k_channels, k_channels, upsample=upsample, dilation=dilation)
+        # cand = HybridBlock(k_channels, k_channels, upsample=upsample, dilation=dilation)
+        cand = HybridBlock(channel_list, k_channels, k_channels, upsample=upsample, dilation=dilation)
         net = GrowingDecoder(fixed_blocks, cand, 3, (target_h, target_w)).type(dtype)
 
         net.set_modulator_status(False)
@@ -465,6 +542,9 @@ def main_final_optimized():
     )
 
     TOTAL_STEPS = 500 * 5 * 10
+
+    # 统计参数
+    total, effective = count_model_parameters(final_net)
     print(f"  > Training for {TOTAL_STEPS} steps...")
 
     best_avg_psnr = 0.0
@@ -476,7 +556,7 @@ def main_final_optimized():
     for step in range(TOTAL_STEPS):
         if step in [500 * 5 * 3, 500 * 5 * 6,
                     500 * 5 * 9]:  # [25000, 45000, 65000]:                   # Jinglei: 我把TOTAL_STEPS写成a*b*c的形式，可以调整c控制阶段
-            for pg in optimizer_mod.param_groups: pg['lr'] *= 0.5
+                    for pg in optimizer_mod.param_groups: pg['lr'] *= 0.5
             print(f"    LR Decay at step {step}")
 
         # accum_loss = 0.0
@@ -528,35 +608,41 @@ def main_final_optimized():
                 print(f"  Step {step}/{TOTAL_STEPS} - Est. PSNR: {avg_psnr:.2f} dB")
             if avg_psnr > best_avg_psnr:
                 best_avg_psnr = avg_psnr
-                best_state = copy.deepcopy(final_net.state_dict())
+                # best_state = copy.deepcopy(final_net.state_dict())
+                # 覆盖保存最佳模型到同一个文件
+                torch.save({
+                        'psnr': best_avg_psnr,
+                        'model_state_dict': final_net.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                    }, best_model_path)
 
     print(f"Training Done. Best Estimated Batch PSNR: {best_avg_psnr:.2f} dB")
 
-    # === Evaluation ===
-    if best_state:
-        final_net.load_state_dict(best_state)
+    # # === Evaluation ===
+    # if best_state:
+    #     final_net.load_state_dict(best_state)
 
-    # final_net.train()
-    final_net.eval()
-    avg_psnr = 0
-    with torch.no_grad():
-        for (u, v) in view_keys:
-            target = lf_data[(u, v)]
-            with autocast('cuda',dtype=torch.bfloat16):  # ← 评估也用 autocast 保持一致
-                out = final_net(net_input_saved, u, v)
-            out = out.float()  # ← 统一转 FP32
-            p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
-            avg_psnr += p  # ← 用 avg_psnr 而非 psnr_list
+    # # final_net.train()
+    # final_net.eval()
+    # avg_psnr = 0
+    # with torch.no_grad():
+    #     for (u, v) in view_keys:
+    #         target = lf_data[(u, v)]
+    #         with autocast('cuda',dtype=torch.bfloat16):  # ← 评估也用 autocast 保持一致
+    #             out = final_net(net_input_saved, u, v)
+    #         out = out.float()  # ← 统一转 FP32
+    #         p = psnr(out.cpu().numpy()[0], target.cpu().numpy()[0])
+    #         avg_psnr += p  # ← 用 avg_psnr 而非 psnr_list
 
-            plt.imsave(os.path.join(save_dir, f"recon_{u}_{v}.png"),
-                       np.clip(out.cpu().numpy()[0].transpose(1, 2, 0), 0, 1))
+    #         plt.imsave(os.path.join(save_dir, f"recon_{u}_{v}.png"),
+    #                    np.clip(out.cpu().numpy()[0].transpose(1, 2, 0), 0, 1))
 
-    print(f"Final Validated Average PSNR: {avg_psnr / TOTAL_VIEWS:.2f} dB")
+    # print(f"Final Validated Average PSNR: {avg_psnr / TOTAL_VIEWS:.2f} dB")
 
-    plt.figure()
-    plt.plot(history_psnr)
-    plt.title("Phase 2 Learning Curve (SA + Unfreeze + Batch20)")
-    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
+    # plt.figure()
+    # plt.plot(history_psnr)
+    # plt.title("Phase 2 Learning Curve (SA + Unfreeze + Batch20)")
+    # plt.savefig(os.path.join(save_dir, "loss_curve.png"))
 
 
 if __name__ == "__main__":
