@@ -556,7 +556,7 @@ def main_final_optimized():
     for step in range(TOTAL_STEPS):
         if step in [500 * 5 * 3, 500 * 5 * 6,
                     500 * 5 * 9]:  # [25000, 45000, 65000]:                   # Jinglei: 我把TOTAL_STEPS写成a*b*c的形式，可以调整c控制阶段
-                    for pg in optimizer_mod.param_groups: pg['lr'] *= 0.5
+            for pg in optimizer_mod.param_groups: pg['lr'] *= 0.5
             print(f"    LR Decay at step {step}")
 
         # accum_loss = 0.0

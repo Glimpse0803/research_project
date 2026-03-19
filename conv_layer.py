@@ -3,11 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F  
 from mire_config import CONFIG
 
-def add_module(self, module):
-    self.add_module(str(len(self) + 1), module)
-
-torch.nn.Module.add = add_module
-
 # 4支路并行
 class DirectionalConv2d(nn.Module):
     def __init__(self, in_f, out_f, direction, dilation=1):
