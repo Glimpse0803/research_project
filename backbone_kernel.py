@@ -11,22 +11,23 @@ from collections import Counter
 from torch.amp import autocast  # 新增，用于半精度训练
 
 # 引入辅助模块
-from helpers import np_to_var, pil_to_np, psnr
+from helpers import np_to_var, pil_to_np, psnr, count_model_parameters
 from mire_config import CONFIG
 from activations import ACT_DICT, get_activation_instance
 from conv_layer import asy_dir_conv_block
+from conv_layer import asy_dir_conv_block_nodia
 from frequency import frequency_analysis
 from conv_layer import DirectionalConv2d
 
 ###############################################################################
 ################### 参考性能（可训练参数量 -- PSNR）, 81张图，boxes ###############
-# 20904 -- 36.08dB
-# 33009 -- 37.87dB
-# 47814 -- 38.50dB
-# 65319 -- 39.60dB
-# 108429 -- 40.57dB
-# 162339 -- 41.38dB
-# 227049 -- 41.79dB
+# 103704 -- 36.08dB
+# 164049 -- 37.87dB
+# 237894 -- 38.50dB
+# 325239 -- 39.60dB
+# 540429 -- 40.57dB
+# 809619 -- 41.38dB
+# 1132809 -- 41.79dB
 ###############################################################################
 
 dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
@@ -90,52 +91,52 @@ def pretreatment(lf_data, branch_channels):
     return channel_list
 
 
-def count_model_parameters(model):
-    total_params = 0
-    effective_params = 0
+# def count_model_parameters(model):
+#     total_params = 0
+#     effective_params = 0
     
-    # 记录已经处理过的参数对象 ID，防止在复杂网络结构中重复计数
-    seen_params = set()
+#     # 记录已经处理过的参数对象 ID，防止在复杂网络结构中重复计数
+#     seen_params = set()
 
-    # 遍历所有子模块
-    for name, module in model.named_modules():
-        # 如果是 DirectionalConv2d，执行特殊逻辑
-        if isinstance(module, DirectionalConv2d):
-            # 处理卷积权重 (weight)
-            p = module.conv.weight
-            if id(p) not in seen_params:
-                p_total = p.numel()
-                # 有效参数 = 激活的 mask 点数 * 输入通道 * 输出通道
-                p_effective = module.effective_param_count()
+#     # 遍历所有子模块
+#     for name, module in model.named_modules():
+#         # 如果是 DirectionalConv2d，执行特殊逻辑
+#         if isinstance(module, DirectionalConv2d):
+#             # 处理卷积权重 (weight)
+#             p = module.conv.weight
+#             if id(p) not in seen_params:
+#                 p_total = p.numel()
+#                 # 有效参数 = 激活的 mask 点数 * 输入通道 * 输出通道
+#                 p_effective = module.effective_param_count()
                 
-                total_params += p_total
-                effective_params += p_effective
-                seen_params.add(id(p))
+#                 total_params += p_total
+#                 effective_params += p_effective
+#                 seen_params.add(id(p))
             
-            # 处理卷积偏置 (bias) bias=False
-            if module.conv.bias is not None:
-                b = module.conv.bias
-                if id(b) not in seen_params:
-                    total_params += b.numel()
-                    effective_params += b.numel()
-                    seen_params.add(id(b))
+#             # 处理卷积偏置 (bias) bias=False
+#             if module.conv.bias is not None:
+#                 b = module.conv.bias
+#                 if id(b) not in seen_params:
+#                     total_params += b.numel()
+#                     effective_params += b.numel()
+#                     seen_params.add(id(b))
                     
-        # 对于非 DirectionalConv2d 的叶子节点模块（如普通的 Conv2d, Linear, BatchNorm）
-        # 我们只处理那些不再包含子模块的层，防止重复统计
-        elif len(list(module.children())) == 0:
-            for p_name, p in module.named_parameters(recurse=False):
-                if id(p) not in seen_params:
-                    total_params += p.numel()
-                    effective_params += p.numel()
-                    seen_params.add(id(p))
+#         # 对于非 DirectionalConv2d 的叶子节点模块（如普通的 Conv2d, Linear, BatchNorm）
+#         # 我们只处理那些不再包含子模块的层，防止重复统计
+#         elif len(list(module.children())) == 0:
+#             for p_name, p in module.named_parameters(recurse=False):
+#                 if id(p) not in seen_params:
+#                     total_params += p.numel()
+#                     effective_params += p.numel()
+#                     seen_params.add(id(p))
 
-    print("-" * 30)
-    print(f"总注册参数量 (Total):     {total_params:,}")
-    print(f"有效计算参数量 (Effective): {effective_params:,}")
-    print(f"减少的冗余参数:           {total_params - effective_params:,}")
-    print("-" * 30)
+#     print("-" * 30)
+#     print(f"总注册参数量 (Total):     {total_params:,}")
+#     print(f"有效计算参数量 (Effective): {effective_params:,}")
+#     print(f"减少的冗余参数:           {total_params - effective_params:,}")
+#     print("-" * 30)
     
-    return total_params, effective_params
+#     return total_params, effective_params
 
 # ==========================================
 # 1. Improved SA (保持不变)
@@ -244,8 +245,16 @@ class HybridBlock(nn.Module):
         self.desc_ch = out_channels - 2
         self.enable_modulator = False
 
+        ####################################################
+        # 原卷积
         # self.desc_conv = conv_layer(in_channels, self.desc_ch, 3, dilation)
+        
+        # 四支路卷积，有dilation
         self.desc_conv = asy_dir_conv_block(in_channels,self.desc_ch,channel_list,'45','135', dilation=dilation)
+        
+        # 四支路卷积，无dilation
+        # self.desc_conv = asy_dir_conv_block_nodia(in_channels,self.desc_ch,channel_list,'45','135')
+        ####################################################
         self.desc_bn = nn.BatchNorm2d(out_channels)  # nn.BatchNorm2d(self.desc_ch, affine=True)
         # self.batch_norm = nn.BatchNorm2d(out_channels)
         # 依然使用 SA
@@ -374,7 +383,7 @@ def main_final_optimized():
     # 确保模型保存目录存在
     model_save_dir = f'outputs/model_{scene_name}'
     os.makedirs(model_save_dir, exist_ok=True)
-    best_model_path = os.path.join(model_save_dir, 'best_model.pth')
+    best_model_path = os.path.join(model_save_dir, 'best_model_dila.pth')
 
     k_channels = CONFIG['k_channels']
     branch_channels = CONFIG['branch_channels']

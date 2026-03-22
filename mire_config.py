@@ -24,6 +24,10 @@ CONFIG = {
     'img_dir': 'data/boxes',
 
     # --- 卷积层通道数调整 (控制参数量) ---
-    'branch_channels': 140
+    'branch_channels': 140,
+
+    # --- 输入可训练Tensor的大小 (控制参数量) ---
+    'view_kernel_w': 6,
+    'view_kernel_h': 7
 
 }

@@ -12,6 +12,11 @@ from torch.autograd import Variable
 
 import matplotlib.pyplot as plt
 
+from conv_layer import asy_dir_conv_block
+from conv_layer import asy_dir_conv_block_nodia
+from frequency import frequency_analysis
+from conv_layer import DirectionalConv2d
+
 
 def load_and_crop(imgname, target_width=512, target_height=512):
     '''
@@ -136,3 +141,52 @@ def savemtx_for_logplot(A, filename="exp.dat"):
     A = [[a[i] for i in ind] for a in A]
     X = np.array([ind] + A)
     np.savetxt(filename, X.T, delimiter=' ')
+
+
+# 参数统计
+def count_model_parameters(model):
+    total_params = 0
+    effective_params = 0
+    
+    # 记录已经处理过的参数对象 ID，防止在复杂网络结构中重复计数
+    seen_params = set()
+
+    # 遍历所有子模块
+    for name, module in model.named_modules():
+        # 如果是 DirectionalConv2d，执行特殊逻辑
+        if isinstance(module, DirectionalConv2d):
+            # 处理卷积权重 (weight)
+            p = module.conv.weight
+            if id(p) not in seen_params:
+                p_total = p.numel()
+                # 有效参数 = 激活的 mask 点数 * 输入通道 * 输出通道
+                p_effective = module.effective_param_count()
+                
+                total_params += p_total
+                effective_params += p_effective
+                seen_params.add(id(p))
+            
+            # 处理卷积偏置 (bias) bias=False
+            if module.conv.bias is not None:
+                b = module.conv.bias
+                if id(b) not in seen_params:
+                    total_params += b.numel()
+                    effective_params += b.numel()
+                    seen_params.add(id(b))
+                    
+        # 对于非 DirectionalConv2d 的叶子节点模块（如普通的 Conv2d, Linear, BatchNorm）
+        # 我们只处理那些不再包含子模块的层，防止重复统计
+        elif len(list(module.children())) == 0:
+            for p_name, p in module.named_parameters(recurse=False):
+                if id(p) not in seen_params:
+                    total_params += p.numel()
+                    effective_params += p.numel()
+                    seen_params.add(id(p))
+
+    print("-" * 30)
+    print(f"总注册参数量 (Total):     {total_params:,}")
+    print(f"有效计算参数量 (Effective): {effective_params:,}")
+    print(f"减少的冗余参数:           {total_params - effective_params:,}")
+    print("-" * 30)
+    
+    return total_params, effective_params
